@@ -743,7 +743,8 @@ int main(int argc, char **argv) {
 		image_ptr = image_unorder_first;
 		while ( image_ptr ) {
 			struct image_list * next = image_ptr->next;
-			if ( image_ptr->image->type == IMAGE_SECONDARY ) {
+			if ( image_ptr->image->type == IMAGE_SECONDARY ||
+				(dev_cold_flash && image_ptr->image->type == IMAGE_APE_ALGO) ) {
 				if ( have_secondary == 0 ) {
 					image_secondary = image_ptr->image;
 					have_secondary = 1;
@@ -888,11 +889,11 @@ int main(int argc, char **argv) {
 		}
 
 		if ( have_secondary == 0 ) {
-			ERROR("Secondary image for Cold Flashing was not specified");
+			ERROR("Secondary or APE algorithm image for Cold Flashing was not specified");
 			ret = 1;
 			goto clean;
 		} else if ( have_secondary == 2 ) {
-			ERROR("More Secondary images for Cold Flashing was specified");
+			ERROR("More than one Secondary/APE algorithm image for Cold Flashing was specified");
 			ret = 1;
 			goto clean;
 		}

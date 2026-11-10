@@ -1,3 +1,8 @@
+# Experimental Nokia N950 RM-680 cold-flash fork
+
+This branch adds the RM-680 APE-algorithm cold-flash protocol to upstream
+0xFFFF 0.10.  Read `N950-RM680-COLDFLASH.md` before building or using it.
+The RM-680 path is experimental and can leave a device unbootable.
 
 
     ------.    ,---------.--.--.

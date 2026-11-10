@@ -1,4 +1,4 @@
-VERSION = 0.10
+VERSION = 0.10-n950rm680cold1
 PREFIX = /usr/local
 
 # NetBSD stuff

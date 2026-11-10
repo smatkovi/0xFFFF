@@ -30,6 +30,113 @@
 
 #define READ_TIMEOUT		500
 #define WRITE_TIMEOUT		3000
+#define XLOADER_FINAL_ACK_TIMEOUT	5000
+#define OMAP_ROM_COMMAND_DELAY_MS	10
+#define OMAP_ROM_PAYLOAD_DELAY_MS	10
+#define XLOADER_STAGE_DELAY_MS		10
+#define USB_INTERWRITE_DELAY_MS		1
+#define OMAP_ROM_TRANSFER_CHUNK		512
+#define XLOADER_TRANSFER_CHUNK		0x10000
+#define USB_ZERO_WRITE_RETRIES		10
+#define USB_ZERO_WRITE_RETRY_DELAY_MS	2
+
+/*
+ * Old OMAP3 mask-ROM USB implementations can STALL when a modern xHCI host
+ * submits consecutive OUT transfers too aggressively.  Keep the workaround
+ * local to cold flashing and report the actual libusb result; upstream's
+ * ERROR_RETURN macro deliberately clears errno and hides this diagnostic.
+ */
+static int cold_bulk_write(usb_dev_handle * udev, const char * bytes, int size,
+	int timeout, int delay_ms, const char * step) {
+	int ret;
+	int saved_errno;
+	const char * usb_error;
+
+	if ( delay_ms > 0 )
+		MSLEEP(delay_ms);
+
+	errno = 0;
+	ret = usb_bulk_write(udev, USB_WRITE_EP, bytes, size, timeout);
+	saved_errno = errno;
+	usb_error = usb_strerror();
+
+	if ( ret != size ) {
+		fprintf(stderr,
+			"Error: %s: usb_bulk_write returned %d, expected %d; "
+			"errno=%d (%s); libusb-global=%s\n",
+			step, ret, size, saved_errno,
+			saved_errno ? strerror(saved_errno) : "none",
+			usb_error ? usb_error : "unknown");
+	}
+
+	return ret;
+}
+
+/*
+ * Nokia's writer keeps submitting the unsent tail of payload data when
+ * libusb-0.1 reports a positive short write or a zero-byte write.  Restrict
+ * that behaviour to payload bytes: protocol words are never retried here.
+ */
+static int cold_bulk_write_payload(usb_dev_handle * udev, const char * bytes,
+	int size, int timeout, int delay_ms, const char * step) {
+	int ret = 0;
+	int total = 0;
+	int zero_retries = 0;
+	int clear_ret;
+	int saved_errno = 0;
+	const char * usb_error;
+
+	while ( total < size ) {
+		if ( delay_ms > 0 )
+			MSLEEP(delay_ms);
+
+		errno = 0;
+		ret = usb_bulk_write(udev, USB_WRITE_EP, bytes + total,
+			size - total, timeout);
+		saved_errno = errno;
+
+		if ( ret > 0 ) {
+			if ( ret > size - total ) {
+				fprintf(stderr,
+					"Error: %s: impossible usb_bulk_write result %d "
+					"for %d remaining bytes\n",
+					step, ret, size - total);
+				return -1;
+			}
+			total += ret;
+			zero_retries = 0;
+			continue;
+		}
+
+		if ( ret == 0 && zero_retries < USB_ZERO_WRITE_RETRIES ) {
+			++zero_retries;
+			clear_ret = usb_clear_halt(udev, USB_WRITE_EP);
+			if ( clear_ret != 0 ) {
+				fprintf(stderr,
+					"Error: %s: could not clear EP 0x%02x halt "
+					"after zero-byte write (ret=%d)\n",
+					step, USB_WRITE_EP, clear_ret);
+				return total;
+			}
+			VERBOSE("Zero-byte USB payload write during %s; cleared EP "
+				"0x%02x halt, retry %d/%d\n", step, USB_WRITE_EP,
+				zero_retries, USB_ZERO_WRITE_RETRIES);
+			MSLEEP(USB_ZERO_WRITE_RETRY_DELAY_MS);
+			continue;
+		}
+
+		usb_error = usb_strerror();
+		fprintf(stderr,
+			"Error: %s: usb_bulk_write returned %d after %d/%d bytes; "
+			"errno=%d (%s); libusb-global=%s\n",
+			step, ret, total, size, saved_errno,
+			saved_errno ? strerror(saved_errno) : "none",
+			usb_error ? usb_error : "unknown");
+		return ret < 0 ? ret : total;
+	}
+
+	return total;
+}
 
 static uint32_t tab[256];
 
@@ -133,6 +240,8 @@ struct xloader_msg {
 
 #define XLOADER_MSG_TYPE_PING	0x6301326E
 #define XLOADER_MSG_TYPE_SEND	0x6302326E
+#define XLOADER_MSG_TYPE_LOAD_APE	0x6304326E
+#define XLOADER_RESPONSE_OK	0x00006FAA
 
 struct xloader_msg xloader_msg_create(uint32_t type, struct image * image) {
 
@@ -182,23 +291,27 @@ static int read_asic(usb_dev_handle * udev, uint8_t * asic_buffer, int size, int
 
 static int send_2nd(usb_dev_handle * udev, struct image * image) {
 
-	uint8_t buffer[1024];
+	uint8_t buffer[OMAP_ROM_TRANSFER_CHUNK];
 	uint32_t need, sent;
 	int ret;
 
 	printf("Sending OMAP peripheral boot message...\n");
-	ret = usb_bulk_write(udev, USB_WRITE_EP, (char *)&omap_peripheral_msg, sizeof(omap_peripheral_msg), WRITE_TIMEOUT);
+	ret = cold_bulk_write(udev, (char *)&omap_peripheral_msg,
+		sizeof(omap_peripheral_msg), WRITE_TIMEOUT, 0,
+		"Sending OMAP peripheral boot message failed");
 	if ( ret != sizeof(omap_peripheral_msg) )
-		ERROR_RETURN("Sending OMAP peripheral boot message failed", -1);
+		return -1;
 
-	MSLEEP(5);
+	MSLEEP(OMAP_ROM_COMMAND_DELAY_MS);
 
 	printf("Sending 2nd X-Loader image size...\n");
-	ret = usb_bulk_write(udev, USB_WRITE_EP, (char *)&image->size, 4, WRITE_TIMEOUT);
+	ret = cold_bulk_write(udev, (char *)&image->size, 4, WRITE_TIMEOUT,
+		USB_INTERWRITE_DELAY_MS,
+		"Sending 2nd X-Loader image size failed");
 	if ( ret != 4 )
-		ERROR_RETURN("Sending 2nd X-Loader image size failed", -1);
+		return -1;
 
-	MSLEEP(5);
+	MSLEEP(OMAP_ROM_PAYLOAD_DELAY_MS);
 
 	printf("Sending 2nd X-Loader image...\n");
 	printf_progressbar(0, image->size);
@@ -211,8 +324,10 @@ static int send_2nd(usb_dev_handle * udev, struct image * image) {
 		ret = image_read(image, buffer, need);
 		if ( ret == 0 )
 			break;
-		if ( usb_bulk_write(udev, USB_WRITE_EP, (char *)buffer, ret, WRITE_TIMEOUT) != ret )
-			PRINTF_ERROR_RETURN("Sending 2nd X-Loader image failed", -1);
+		if ( cold_bulk_write(udev, (char *)buffer, ret, WRITE_TIMEOUT,
+			USB_INTERWRITE_DELAY_MS,
+			"Sending 2nd X-Loader image failed") != ret )
+			return -1;
 		sent += ret;
 		printf_progressbar(sent, image->size);
 	}
@@ -225,24 +340,55 @@ static int send_2nd(usb_dev_handle * udev, struct image * image) {
 static int send_secondary(usb_dev_handle * udev, struct image * image) {
 
 	struct xloader_msg init_msg;
-	uint8_t buffer[1024];
+	/* Match Nokia's cold-flash writer.  libusb-0.1 splits this into
+	 * contiguous 16 KiB usbfs URBs; small, separately submitted writes can
+	 * make the running X-Loader stall endpoint 1 after the first packet. */
+	uint8_t buffer[XLOADER_TRANSFER_CHUNK];
 	uint32_t need, sent;
+	uint32_t response;
+	uint32_t command;
+	const char * payload_name;
+	const char * payload_error;
 	int ret;
 
-	init_msg = xloader_msg_create(XLOADER_MSG_TYPE_SEND, image);
+	/* Harmattan's RM-680/RM-696 2nd uses 0x6304 to load the signed
+	 * ape-algo.  Keep 0x6302 for legacy Secondary images. */
+	command = image->type == IMAGE_APE_ALGO ?
+		XLOADER_MSG_TYPE_LOAD_APE : XLOADER_MSG_TYPE_SEND;
+	payload_name = image->type == IMAGE_APE_ALGO ?
+		"APE algorithm" : "Secondary";
+	payload_error = image->type == IMAGE_APE_ALGO ?
+		"Sending APE algorithm failed" : "Sending Secondary image failed";
+	init_msg = xloader_msg_create(command, image);
+	VERBOSE("X-Loader image header: command=0x%04X size=%u "
+		"crc-data=0x%08X crc-header=0x%08X\n",
+		(unsigned int)((command >> 16) & 0xffff), init_msg.size,
+		init_msg.crc1, init_msg.crc2);
 
 	printf("Sending X-Loader init message...\n");
-	ret = usb_bulk_write(udev, USB_WRITE_EP, (char *)&init_msg, sizeof(init_msg), WRITE_TIMEOUT);
+	ret = cold_bulk_write(udev, (char *)&init_msg, sizeof(init_msg),
+		WRITE_TIMEOUT, USB_INTERWRITE_DELAY_MS,
+		"Sending X-Loader init message failed");
 	if ( ret != sizeof(init_msg) )
-		ERROR_RETURN("Sending X-Loader init message failed", -1);
+		return -1;
 
 	printf("Waiting for X-Loader response...\n");
-	MSLEEP(5);
-	ret = usb_bulk_read(udev, USB_READ_EP, (char *)&buffer, 4, READ_TIMEOUT); /* 4 bytes - dummy value */
+	MSLEEP(20);
+	ret = usb_bulk_read(udev, USB_READ_EP, (char *)&response,
+		sizeof(response), READ_TIMEOUT);
 	if ( ret != 4 )
 		ERROR_RETURN("No response", -1);
+	if ( response != XLOADER_RESPONSE_OK ) {
+		fprintf(stderr, "Error: X-Loader rejected image command "
+			"0x%04X: response 0x%08X, expected 0x%08X\n",
+			(unsigned int)((command >> 16) & 0xffff), response,
+			XLOADER_RESPONSE_OK);
+		return -1;
+	}
 
-	printf("Sending Secondary image...\n");
+	MSLEEP(XLOADER_STAGE_DELAY_MS);
+
+	printf("Sending %s image...\n", payload_name);
 	printf_progressbar(0, image->size);
 	image_seek(image, 0);
 	sent = 0;
@@ -253,17 +399,27 @@ static int send_secondary(usb_dev_handle * udev, struct image * image) {
 		ret = image_read(image, buffer, need);
 		if ( ret == 0 )
 			break;
-		if ( usb_bulk_write(udev, USB_WRITE_EP, (char *)buffer, ret, WRITE_TIMEOUT) != ret )
-			PRINTF_ERROR_RETURN("Sending Secondary image failed", -1);
+		if ( cold_bulk_write_payload(udev, (char *)buffer, ret,
+			WRITE_TIMEOUT,
+			USB_INTERWRITE_DELAY_MS,
+			payload_error) != ret )
+			return -1;
 		sent += ret;
 		printf_progressbar(sent, image->size);
 	}
 
 	printf("Waiting for X-Loader response...\n");
-	MSLEEP(5);
-	ret = usb_bulk_read(udev, USB_READ_EP, (char *)&buffer, 4, READ_TIMEOUT); /* 4 bytes - dummy value */
+	MSLEEP(20);
+	ret = usb_bulk_read(udev, USB_READ_EP, (char *)&response,
+		sizeof(response), XLOADER_FINAL_ACK_TIMEOUT);
 	if ( ret != 4 )
 		ERROR_RETURN("No response", -1);
+	if ( response != XLOADER_RESPONSE_OK ) {
+		fprintf(stderr, "Error: X-Loader rejected image data: response "
+			"0x%08X, expected 0x%08X\n",
+			response, XLOADER_RESPONSE_OK);
+		return -1;
+	}
 
 	return 0;
 
@@ -281,9 +437,11 @@ static int ping_timeout(usb_dev_handle * udev) {
 		int try_read = 4;
 
 		printf("Sending X-Loader ping message\n");
-		ret = usb_bulk_write(udev, USB_WRITE_EP, (char *)&ping_msg, sizeof(ping_msg), WRITE_TIMEOUT);
+		ret = cold_bulk_write(udev, (char *)&ping_msg, sizeof(ping_msg),
+			WRITE_TIMEOUT, USB_INTERWRITE_DELAY_MS,
+			"Sending X-Loader ping message failed");
 		if ( ret != sizeof(ping_msg) )
-			ERROR_RETURN("Sending X-Loader ping message failed", -1);
+			return -1;
 
 		printf("Waiting for X-Loader pong response...\n");
 		while ( try_read > 0 ) {
@@ -387,8 +545,9 @@ int cold_flash(struct usb_device_info * dev, struct image * x2nd, struct image *
 	if ( x2nd->type != IMAGE_2ND )
 		ERROR_RETURN("Image type is not 2nd X-Loader", -1);
 
-	if ( secondary->type != IMAGE_SECONDARY )
-		ERROR_RETURN("Image type is not Secondary", -1);
+	if ( secondary->type != IMAGE_SECONDARY &&
+		secondary->type != IMAGE_APE_ALGO )
+		ERROR_RETURN("Image type is not Secondary or APE algorithm", -1);
 
 	if ( send_2nd(dev->udev, x2nd) != 0 )
 		ERROR_RETURN("Sending 2nd X-Loader image failed", -1);
@@ -409,9 +568,11 @@ int leave_cold_flash(struct usb_device_info * dev) {
 	int ret;
 
 	printf("Sending OMAP memory boot message...\n");
-	ret = usb_bulk_write(dev->udev, USB_WRITE_EP, (char *)&omap_memory_msg, sizeof(omap_memory_msg), WRITE_TIMEOUT);
+	ret = cold_bulk_write(dev->udev, (char *)&omap_memory_msg,
+		sizeof(omap_memory_msg), WRITE_TIMEOUT, USB_INTERWRITE_DELAY_MS,
+		"Sending OMAP memory boot message failed");
 	if ( ret != sizeof(omap_memory_msg) )
-		ERROR_RETURN("Sending OMAP memory boot message failed", -1);
+		return -1;
 
 	MSLEEP(250);
 	return 0;

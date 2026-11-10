@@ -1,0 +1,7 @@
+/src/0xFFFF
+/src/0xFFFF.1
+/src/0xFFFF.1.tmp
+/src/*.o
+/src/libusb-sniff-32.so
+/src/libusb-sniff-64.so
+/src/mangen
